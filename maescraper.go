@@ -168,7 +168,7 @@ func saveToDatabase(df *dataframe.DataFrame) {
 
 	// Check last inserted date
 	var lastDate time.Time
-	err = conn.QueryRow(context.Background(), "SELECT MAX(date) FROM public.forex3").Scan(&lastDate)
+	err = conn.QueryRow(context.Background(), "SELECT MAX(date) FROM public.forex").Scan(&lastDate)
 	if err != nil && err != pgx.ErrNoRows {
 		log.Printf("Failed to query last date: %v\n", err)
 	}
@@ -236,7 +236,7 @@ func saveToDatabase(df *dataframe.DataFrame) {
 
 	// Insert data into database
 	query := `
-		INSERT INTO public.forex3 (date, rueda, instrumento, currency_out, currency_in, settle, settle_date, monto, cotizacion, hora)
+		INSERT INTO public.forex (date, rueda, instrumento, currency_out, currency_in, settle, settle_date, monto, cotizacion, hora)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 	_, err = conn.Prepare(context.Background(), "insert_forex", query)
 	if err != nil {
@@ -253,5 +253,5 @@ func saveToDatabase(df *dataframe.DataFrame) {
 		}
 	}
 
-	fmt.Printf("Inserted %d rows into forex3 table.\n", successfulInserts)
+	fmt.Printf("Inserted %d rows into forex table.\n", successfulInserts)
 }
