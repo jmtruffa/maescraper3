@@ -4,31 +4,81 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-gota/gota/dataframe"
-	"github.com/go-gota/gota/series"
 	"github.com/jackc/pgx/v5"
 )
 
 const (
-	apiURL = "https://www.mae.com.ar/mercados/forex/api/LeerForexPrecios"
+	apiURL = "https://api.mae.com.ar/MarketData/v1/mercado/cotizaciones/forex"
 )
 
-// ForexData represents the structure of the API response data
+// ForexData represents the structure of the new API response
 type ForexData struct {
-	Fecha      string  `json:"Fecha"`
-	Titulo     string  `json:"Titulo"`
-	Rueda      string  `json:"Rueda"`
-	Monto      string  `json:"Monto"`
-	Cotizacion float64 `json:"Cotizacion"`
-	Hora       string  `json:"Hora"`
+	Fecha                string  `json:"fecha"`
+	Ticker               string  `json:"ticker"`
+	Descripcion          string  `json:"descripcion"`
+	TipoEmision          string  `json:"tipoEmision"`
+	Segmento             string  `json:"segmento"`
+	CodigoSegmento       string  `json:"codigoSegmento"`
+	Plazo                string  `json:"plazo"`
+	CodigoPlazo          string  `json:"codigoPlazo"`
+	Moneda               string  `json:"moneda"`
+	FechaLiquidacion     string  `json:"fechaLiquidacion"`
+	VolumenAcumulado     int     `json:"volumenAcumulado"`
+	MontoAcumulado       float64 `json:"montoAcumulado"`
+	PrecioUltimo         float64 `json:"precioUltimo"`
+	UltimaTasa           float64 `json:"ultimaTasa"`
+	PrecioCierreAnterior float64 `json:"precioCierreAnterior"`
+	PrecioMinimo         float64 `json:"precioMinimo"`
+	PrecioMaximo         float64 `json:"precioMaximo"`
+	OpenInterest         int     `json:"openInterest"`
+	PrecioCierre         float64 `json:"precioCierre"`
+	Variacion            float64 `json:"variacion"`
+}
+
+// deriveCurrencyOut extracts the short currency code from the ticker.
+// Tickers ending in "$T" get it stripped: "USB$T" -> "USB", "MB$T" -> "MB"
+// Other tickers are kept as-is: "USMEP" -> "USMEP", "UBMEP" -> "UBMEP"
+func deriveCurrencyOut(ticker string) string {
+	return strings.TrimSuffix(ticker, "$T")
+}
+
+// deriveCurrencyIn maps the moneda field to the old-style currency_in code.
+// "T" (pesos transferencia) -> "ART"
+// Other values are returned as-is as fallback.
+func deriveCurrencyIn(moneda string) string {
+	switch moneda {
+	case "T":
+		return "ART"
+	default:
+		return moneda
+	}
+}
+
+// deriveRueda maps the segmento field to the old-style rueda code.
+// "Minorista" -> "CAM2", "Mayorista" -> "CAM1"
+func deriveRueda(segmento string) string {
+	switch segmento {
+	case "Minorista":
+		return "CAM2"
+	case "Mayorista":
+		return "CAM1"
+	default:
+		return segmento
+	}
+}
+
+// buildInstrumento builds the instrumento string in the old format:
+// "CURRENCY_OUT / CURRENCY_IN PLAZO" e.g. "USB / ART 000"
+func buildInstrumento(currencyOut, currencyIn, plazo string) string {
+	return fmt.Sprintf("%s / %s %s", currencyOut, currencyIn, plazo)
 }
 
 func main() {
@@ -48,102 +98,51 @@ func main() {
 	fmt.Println("---------------------------------------------")
 }
 
-func fetchForexData() *dataframe.DataFrame {
-	// Fetch data from API
-	resp, err := http.Get(apiURL)
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Println("Failed to fetch data from API.")
+func fetchForexData() []ForexData {
+	apiKey := os.Getenv("MAE_API_KEY")
+	if apiKey == "" {
+		log.Fatal("MAE_API_KEY environment variable not set")
+	}
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("Failed to create request: %v", err)
+		return nil
+	}
+	req.Header.Set("x-api-key", apiKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to fetch data from API: %v", err)
 		return nil
 	}
 	defer resp.Body.Close()
 
-	// Parse JSON response
-	var result struct {
-		Data []ForexData `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		fmt.Println("Failed to decode JSON.")
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("API returned status %d: %s", resp.StatusCode, string(body))
 		return nil
 	}
-	if len(result.Data) == 0 {
+
+	// The new API returns a flat JSON array: [{ ... }, { ... }]
+	var data []ForexData
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		log.Printf("Failed to decode JSON: %v", err)
+		return nil
+	}
+
+	if len(data) == 0 {
 		fmt.Println("No data received from API.")
 		return nil
 	}
 
-	// Create DataFrame from API data
-	df := dataframe.LoadStructs(result.Data)
-
-	// Process 'Fecha' (date) as strings
-	var dates []string
-	for _, fecha := range df.Col("Fecha").Records() {
-		t, err := time.Parse("060102", fecha) // 'yymmdd' format
-		if err != nil {
-			dates = append(dates, "") // Handle invalid dates
-		} else {
-			dates = append(dates, t.Format("2006-01-02"))
-		}
-	}
-
-	// Extract currency details from 'Titulo' using regex
-	pattern := regexp.MustCompile(`(?P<currency_out>[A-Z]+)\s*/\s*(?P<currency_in>[A-Z]+)\s*(?P<settle>\d+)\s*(?P<settle_date>\d{6})`)
-	var currencyOut, currencyIn, settle, settleDate []interface{} // Use interface{} to allow nil
-	for _, titulo := range df.Col("Titulo").Records() {
-		matches := pattern.FindStringSubmatch(titulo)
-		if len(matches) == 5 {
-			currencyOut = append(currencyOut, matches[1])
-			currencyIn = append(currencyIn, matches[2])
-			settle = append(settle, matches[3])         // Keep as string for now, convert to int later
-			settleDate = append(settleDate, matches[4]) // Keep as string for now, convert to date later
-		} else {
-			currencyOut = append(currencyOut, nil)
-			currencyIn = append(currencyIn, nil)
-			settle = append(settle, nil)
-			settleDate = append(settleDate, nil)
-		}
-	}
-
-	// Process 'Monto' (convert to float)
-	var montos []float64
-	for _, monto := range df.Col("Monto").Records() {
-		m := strings.ReplaceAll(monto, ",", "")
-		f, err := strconv.ParseFloat(m, 64)
-		if err != nil {
-			montos = append(montos, 0.0)
-		} else {
-			montos = append(montos, f)
-		}
-	}
-
-	// Process 'Hora' (convert to time)
-	var horas []string
-	for _, hora := range df.Col("Hora").Records() {
-		t, err := time.Parse("15:04:05", hora) // 'HH:MM:SS' format
-		if err != nil {
-			horas = append(horas, "00:00:00")
-		} else {
-			horas = append(horas, t.Format("15:04:05"))
-		}
-	}
-
-	// Create a new DataFrame with processed data using series.New
-	newDF := dataframe.New(
-		series.New(dates, series.String, "date"),
-		series.New(df.Col("Rueda").Records(), series.String, "rueda"),
-		series.New(df.Col("Titulo").Records(), series.String, "instrumento"),
-		series.New(currencyOut, series.String, "currency_out"),
-		series.New(currencyIn, series.String, "currency_in"),
-		series.New(settle, series.String, "settle"),
-		series.New(settleDate, series.String, "settle_date"),
-		series.New(montos, series.Float, "monto"),
-		series.New(df.Col("Cotizacion").Float(), series.Float, "cotizacion"),
-		series.New(horas, series.String, "hora"),
-	)
-
-	return &newDF
+	fmt.Printf("Received %d records from API.\n", len(data))
+	return data
 }
 
-func saveToDatabase(df *dataframe.DataFrame) {
-	if df == nil || df.Nrow() == 0 {
+func saveToDatabase(data []ForexData) {
+	if len(data) == 0 {
 		fmt.Println("No data to save.")
 		return
 	}
@@ -173,85 +172,102 @@ func saveToDatabase(df *dataframe.DataFrame) {
 		log.Printf("Failed to query last date: %v\n", err)
 	}
 
-	// Filter new data and prepare rows
-	var rowsToInsert [][]any
-	successfulInserts := 0
-	for i := 0; i < df.Nrow(); i++ {
-		dateStr := df.Col("date").Val(i).(string)
-		date, err := time.Parse("2006-01-02", dateStr)
-		if err != nil {
-			continue // Skip invalid dates
-		}
-
-		// Handle settle (integer, nullable)
-		var settleVal interface{}
-		settleStr, settleOk := df.Col("settle").Val(i).(string)
-		if settleOk && settleStr != "" {
-			settleInt, err := strconv.Atoi(settleStr)
-			if err != nil {
-				log.Printf("Invalid settle value '%s' at row %d, using NULL", settleStr, i)
-				settleVal = nil
-			} else {
-				settleVal = settleInt
-			}
-		} else {
-			settleVal = nil
-		}
-
-		// Handle settle_date (date, nullable)
-		var settleDateVal interface{}
-		settleDateStr, settleDateOk := df.Col("settle_date").Val(i).(string)
-		if settleDateOk && settleDateStr != "" {
-			settleDateTime, err := time.Parse("060102", settleDateStr) // Parse 'yymmdd' to time.Time
-			if err != nil {
-				log.Printf("Invalid settle_date value '%s' at row %d, using NULL", settleDateStr, i)
-				settleDateVal = nil
-			} else {
-				settleDateVal = settleDateTime
-			}
-		} else {
-			settleDateVal = nil
-		}
-
-		if lastDate.IsZero() || date.After(lastDate) {
-			rowsToInsert = append(rowsToInsert, []any{
-				date,
-				df.Col("rueda").Val(i),
-				df.Col("instrumento").Val(i),
-				df.Col("currency_out").Val(i),
-				df.Col("currency_in").Val(i),
-				settleVal,     // int or nil
-				settleDateVal, // time.Time or nil
-				df.Col("monto").Val(i),
-				df.Col("cotizacion").Val(i),
-				df.Col("hora").Val(i),
-			})
-		}
-	}
-
-	if len(rowsToInsert) == 0 {
-		fmt.Println("No new data to insert.")
-		return
-	}
-
-	// Insert data into database
+	// Prepare insert statement
+	// Existing columns: date, rueda, instrumento, currency_out, currency_in, settle, settle_date, monto, cotizacion, hora
+	// New columns: descripcion, tipo_emision, codigo_segmento, codigo_plazo, moneda, monto_acumulado,
+	//              precio_ultimo, ultima_tasa, precio_cierre_anterior, precio_minimo, precio_maximo,
+	//              open_interest, variacion
 	query := `
-		INSERT INTO public.forex (date, rueda, instrumento, currency_out, currency_in, settle, settle_date, monto, cotizacion, hora)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+		INSERT INTO public.forex (
+			date, rueda, instrumento, currency_out, currency_in, settle, settle_date, monto, cotizacion, hora,
+			descripcion, tipo_emision, codigo_segmento, codigo_plazo, moneda, monto_acumulado,
+			precio_ultimo, ultima_tasa, precio_cierre_anterior, precio_minimo, precio_maximo,
+			open_interest, variacion
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+		          $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`
+
 	_, err = conn.Prepare(context.Background(), "insert_forex", query)
 	if err != nil {
 		log.Printf("Failed to prepare statement: %v\n", err)
 		return
 	}
 
-	for _, row := range rowsToInsert {
-		_, err := conn.Exec(context.Background(), "insert_forex", row...)
+	successfulInserts := 0
+	skipped := 0
+	for _, d := range data {
+		// Parse fecha - format: "2024-11-15T00:00:00"
+		fecha, err := time.Parse("2006-01-02T15:04:05", d.Fecha)
 		if err != nil {
-			log.Printf("Failed to insert row: %v\n", err)
+			log.Printf("Invalid fecha '%s': %v", d.Fecha, err)
+			continue
+		}
+
+		// Skip records already in the database
+		if !lastDate.IsZero() && !fecha.After(lastDate) {
+			skipped++
+			continue
+		}
+
+		// Derive currency codes, rueda and instrumento
+		currencyOut := deriveCurrencyOut(d.Ticker)
+		currencyIn := deriveCurrencyIn(d.Moneda)
+		rueda := deriveRueda(d.Segmento)
+		instrumento := buildInstrumento(currencyOut, currencyIn, d.Plazo)
+
+		// Parse settle (plazo) to integer
+		var settleVal *int
+		if d.Plazo != "" {
+			s, err := strconv.Atoi(d.Plazo)
+			if err == nil {
+				settleVal = &s
+			}
+		}
+
+		// Parse fecha_liquidacion (nullable - "0001-01-01T00:00:00" means no date)
+		var settleDateVal *time.Time
+		if d.FechaLiquidacion != "" && d.FechaLiquidacion != "0001-01-01T00:00:00" {
+			t, err := time.Parse("2006-01-02T15:04:05", d.FechaLiquidacion)
+			if err == nil {
+				settleDateVal = &t
+			}
+		}
+
+		_, err = conn.Exec(context.Background(), "insert_forex",
+			// Existing columns
+			fecha,                // date
+			rueda,                // rueda (CAM1/CAM2)
+			instrumento,          // instrumento (e.g. "USB / ART 000")
+			currencyOut,          // currency_out (parsed from descripcion)
+			currencyIn,           // currency_in (parsed from descripcion)
+			settleVal,            // settle (plazo as int)
+			settleDateVal,        // settle_date (fecha_liquidacion)
+			d.VolumenAcumulado,   // monto (API: volumenAcumulado)
+			d.PrecioCierre,       // cotizacion
+			nil,                  // hora (not available in new API)
+			// New columns
+			d.Descripcion,          // descripcion
+			d.TipoEmision,          // tipo_emision
+			d.CodigoSegmento,       // codigo_segmento
+			d.CodigoPlazo,          // codigo_plazo
+			d.Moneda,               // moneda
+			d.MontoAcumulado,       // monto_acumulado
+			d.PrecioUltimo,         // precio_ultimo
+			d.UltimaTasa,           // ultima_tasa
+			d.PrecioCierreAnterior, // precio_cierre_anterior
+			d.PrecioMinimo,         // precio_minimo
+			d.PrecioMaximo,         // precio_maximo
+			d.OpenInterest,         // open_interest
+			d.Variacion,            // variacion
+		)
+		if err != nil {
+			log.Printf("Failed to insert row (ticker=%s, fecha=%s): %v\n", d.Ticker, d.Fecha, err)
 		} else {
 			successfulInserts++
 		}
 	}
 
+	if skipped > 0 {
+		fmt.Printf("Skipped %d records already in database.\n", skipped)
+	}
 	fmt.Printf("Inserted %d rows into forex table.\n", successfulInserts)
 }
