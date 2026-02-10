@@ -203,7 +203,7 @@ func saveToDatabase(data []ForexData) {
 		}
 
 		// Skip records already in the database
-		if !lastDate.IsZero() && !fecha.After(lastDate) {
+		if !lastDate.IsZero() && fecha.Format("2006-01-02") <= lastDate.Format("2006-01-02") {
 			skipped++
 			continue
 		}
