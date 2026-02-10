@@ -91,13 +91,17 @@ func main() {
 	defer conn.Close(context.Background())
 
 	// Get last date in forex table
-	today := time.Now().Truncate(24 * time.Hour)
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	lastDate := getLastDate(conn)
 
-	fmt.Printf("Last date in DB: %s\n", lastDate.Format("2006-01-02"))
-	fmt.Printf("Today: %s\n", today.Format("2006-01-02"))
+	lastDateStr := lastDate.Format("2006-01-02")
+	todayStr := today.Format("2006-01-02")
 
-	if !lastDate.IsZero() && !lastDate.Before(today) {
+	fmt.Printf("Last date in DB: %s\n", lastDateStr)
+	fmt.Printf("Today: %s\n", todayStr)
+
+	if lastDateStr >= todayStr {
 		fmt.Println("Database is up to date. Nothing to do.")
 		fmt.Println("---------------------------------------------")
 		return
@@ -111,6 +115,12 @@ func main() {
 		fechaDesde = lastDate.AddDate(0, 0, 1)
 	}
 	fechaHasta := today
+
+	if fechaDesde.After(fechaHasta) {
+		fmt.Println("No date range to fetch. Nothing to do.")
+		fmt.Println("---------------------------------------------")
+		return
+	}
 
 	fmt.Printf("Fetching data from %s to %s\n", fechaDesde.Format("2006-01-02"), fechaHasta.Format("2006-01-02"))
 
